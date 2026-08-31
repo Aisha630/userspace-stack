@@ -1,0 +1,23 @@
+[package]
+name = "userspace-stack"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A dependency-free userspace TCP/IP stack with Linux TUN/TAP support"
+
+[lib]
+name = "userspace_stack"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ustack"
+path = "src/main.rs"
+
+[[bin]]
+name = "stack-bench"
+path = "src/bin/stack-bench.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
