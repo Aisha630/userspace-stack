@@ -46,4 +46,31 @@ This benchmark bypasses the device boundary and measures the deterministic
 protocol engine in memory. Use the Docker interoperability benchmark for an
 end-to-end number through the Linux networking stack and TAP device.
 
+## TAP throughput benchmark
+
+`tap-bench` mirrors
+[smoltcp's directional throughput example](https://github.com/smoltcp-rs/smoltcp/blob/main/examples/benchmark.rs).
+`reader` sends data from this stack to a Linux TCP socket; `writer` sends data
+from the Linux socket into this stack's sink. Both paths include Ethernet and
+IPv4 framing, TCP checksums, the TAP device, and the Linux TCP stack.
+
+On Linux, build once and run each direction with permission to create a TAP
+interface:
+
+```sh
+cargo build --release --bin tap-bench
+sudo ./target/release/tap-bench --mib 1024 reader
+sudo ./target/release/tap-bench --mib 1024 writer
+```
+
+Or run it in a privileged Docker container:
+
+```sh
+docker build -t userspace-stack .
+docker run --rm --privileged --entrypoint target/release/tap-bench \
+  userspace-stack --mib 1024 reader
+docker run --rm --privileged --entrypoint target/release/tap-bench \
+  userspace-stack --mib 1024 writer
+```
+
 See [BENCHMARKS.md](BENCHMARKS.md) for recorded results and methodology.

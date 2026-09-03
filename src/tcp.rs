@@ -103,6 +103,7 @@ struct Connection {
     state: State,
     recv_next: u32,
     send_next: u32,
+    peer_window: u16,
     outstanding: Vec<Outstanding>,
 }
 
@@ -116,15 +117,22 @@ pub struct Outbound {
 pub struct Engine {
     local_ip: [u8; 4],
     listeners: Vec<u16>,
+    sink_ports: Vec<u16>,
     connections: HashMap<ConnectionKey, Connection>,
     rto: Duration,
 }
 
 impl Engine {
-    pub fn new(local_ip: [u8; 4], listeners: Vec<u16>, rto: Duration) -> Self {
+    pub fn new(
+        local_ip: [u8; 4],
+        listeners: Vec<u16>,
+        sink_ports: Vec<u16>,
+        rto: Duration,
+    ) -> Self {
         Self {
             local_ip,
             listeners,
+            sink_ports,
             connections: HashMap::new(),
             rto,
         }
@@ -136,6 +144,50 @@ impl Engine {
 
     pub fn state(&self, key: ConnectionKey) -> Option<State> {
         self.connections.get(&key).map(|c| c.state)
+    }
+
+    pub fn send_capacity(&self, key: ConnectionKey) -> usize {
+        let Some(connection) = self.connections.get(&key) else {
+            return 0;
+        };
+        if connection.state != State::Established {
+            return 0;
+        }
+        let in_flight = connection
+            .outstanding
+            .iter()
+            .map(|sent| sent.end_sequence.wrapping_sub(sent.sequence) as usize)
+            .sum::<usize>();
+        usize::from(connection.peer_window).saturating_sub(in_flight)
+    }
+
+    pub fn send(&mut self, key: ConnectionKey, payload: &[u8], now: Instant) -> Option<Outbound> {
+        if payload.is_empty() || payload.len() > self.send_capacity(key) {
+            return None;
+        }
+        let connection = self.connections.get_mut(&key)?;
+        let sequence = connection.send_next;
+        connection.send_next = connection.send_next.wrapping_add(payload.len() as u32);
+        connection.outstanding.push(Outstanding {
+            sequence,
+            end_sequence: connection.send_next,
+            flags: ACK | PSH,
+            payload: payload.to_vec(),
+            last_sent: now,
+            retries: 0,
+        });
+        Some(Outbound {
+            key,
+            bytes: make_segment(
+                self.local_ip,
+                key,
+                sequence,
+                connection.recv_next,
+                ACK | PSH,
+                payload,
+            ),
+            retransmission: false,
+        })
     }
 
     pub fn handle(
@@ -167,6 +219,7 @@ impl Engine {
                 state: State::SynReceived,
                 recv_next: segment.sequence.wrapping_add(1),
                 send_next: iss.wrapping_add(1),
+                peer_window: segment.window,
                 outstanding: Vec::new(),
             };
             let bytes = make_segment(
@@ -197,6 +250,7 @@ impl Engine {
         }
 
         let connection = self.connections.get_mut(&key).expect("connection exists");
+        connection.peer_window = segment.window;
         if segment.flags & ACK != 0 {
             connection
                 .outstanding
@@ -220,12 +274,16 @@ impl Engine {
                     connection.recv_next = connection
                         .recv_next
                         .wrapping_add(segment.payload.len() as u32);
-                    events.push(Event::Data(key, segment.payload.to_vec()));
-                    let sequence = connection.send_next;
-                    connection.send_next = connection
-                        .send_next
-                        .wrapping_add(segment.payload.len() as u32);
-                    response = Some((sequence, ACK | PSH, segment.payload.to_vec()));
+                    if self.sink_ports.contains(&key.local_port) {
+                        response = Some((connection.send_next, ACK, Vec::new()));
+                    } else {
+                        events.push(Event::Data(key, segment.payload.to_vec()));
+                        let sequence = connection.send_next;
+                        connection.send_next = connection
+                            .send_next
+                            .wrapping_add(segment.payload.len() as u32);
+                        response = Some((sequence, ACK | PSH, segment.payload.to_vec()));
+                    }
                 } else if !segment.payload.is_empty() {
                     response = Some((connection.send_next, ACK, Vec::new()));
                 }

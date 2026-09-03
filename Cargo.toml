@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "stack-bench"
 path = "src/bin/stack-bench.rs"
 
+[[bin]]
+name = "tap-bench"
+path = "src/bin/tap-bench.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

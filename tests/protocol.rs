@@ -344,3 +344,57 @@ fn corrupt_tcp_checksum_is_rejected() {
     segment[16] ^= 1;
     assert!(ip_to_stack(&mut stack, ipv4::PROTOCOL_TCP, &segment, Instant::now()).is_empty());
 }
+
+#[test]
+fn tcp_sink_acknowledges_without_echoing() {
+    let mut stack = Stack::new(Config {
+        tcp_sink_ports: vec![8080],
+        ..Config::default()
+    });
+    let now = Instant::now();
+    let (client_seq, server_seq) = connect(&mut stack, 30_008, now);
+    let replies = tcp_send(
+        &mut stack,
+        30_008,
+        client_seq,
+        server_seq,
+        tcp::ACK | tcp::PSH,
+        b"discard me",
+        now,
+    );
+    let reply = parse_tcp_response(&replies[0]);
+    assert!(reply.payload.is_empty());
+    assert_eq!(reply.acknowledgment, client_seq + 10);
+}
+
+#[test]
+fn stack_can_send_tcp_data_to_an_established_peer() {
+    let mut stack = stack();
+    let now = Instant::now();
+    let (client_seq, server_seq) = connect(&mut stack, 30_009, now);
+    let key = tcp::ConnectionKey {
+        remote_ip: REMOTE_IP,
+        remote_port: 30_009,
+        local_port: 8080,
+    };
+    assert_eq!(stack.tcp_send_capacity(key), 65_535);
+
+    let packet = stack.send_tcp_ipv4(key, b"from stack", now).unwrap();
+    let sent = parse_tcp_response(&packet);
+    assert_eq!(sent.sequence, server_seq);
+    assert_eq!(sent.acknowledgment, client_seq);
+    assert_eq!(sent.payload, b"from stack");
+    assert_eq!(stack.tcp_send_capacity(key), 65_525);
+
+    let ack = tcp_send(
+        &mut stack,
+        30_009,
+        client_seq,
+        server_seq + 10,
+        tcp::ACK,
+        &[],
+        now,
+    );
+    assert!(ack.is_empty());
+    assert_eq!(stack.tcp_send_capacity(key), 65_535);
+}

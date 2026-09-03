@@ -7,6 +7,8 @@ pub struct Config {
     pub local_ip: [u8; 4],
     pub local_mac: MacAddr,
     pub tcp_listeners: Vec<u16>,
+    /// TCP listener ports that acknowledge and discard data instead of echoing it.
+    pub tcp_sink_ports: Vec<u16>,
     pub udp_echo_ports: Vec<u16>,
     pub retransmission_timeout: Duration,
 }
@@ -17,6 +19,7 @@ impl Default for Config {
             local_ip: [10, 0, 0, 2],
             local_mac: [0x02, 0, 0, 0, 0, 2],
             tcp_listeners: vec![8080],
+            tcp_sink_ports: Vec::new(),
             udp_echo_ports: vec![7],
             retransmission_timeout: Duration::from_millis(200),
         }
@@ -55,6 +58,7 @@ impl Stack {
         let tcp = tcp::Engine::new(
             config.local_ip,
             config.tcp_listeners.clone(),
+            config.tcp_sink_ports.clone(),
             config.retransmission_timeout,
         );
         Self {
@@ -72,6 +76,40 @@ impl Stack {
 
     pub fn drain_events(&mut self) -> impl Iterator<Item = StackEvent> + '_ {
         self.events.drain(..)
+    }
+
+    /// Returns how many bytes can currently be queued for an established TCP peer.
+    pub fn tcp_send_capacity(&self, key: tcp::ConnectionKey) -> usize {
+        self.tcp.send_capacity(key)
+    }
+
+    /// Queues application data and returns a raw IPv4 packet for TUN mode.
+    pub fn send_tcp_ipv4(
+        &mut self,
+        key: tcp::ConnectionKey,
+        payload: &[u8],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let output = self.tcp.send(key, payload, now)?;
+        Some(self.wrap_ipv4(key.remote_ip, ipv4::PROTOCOL_TCP, &output.bytes))
+    }
+
+    /// Queues application data and returns an Ethernet frame for TAP mode.
+    pub fn send_tcp_ethernet(
+        &mut self,
+        key: tcp::ConnectionKey,
+        payload: &[u8],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let remote_mac = self.arp_cache.get(&key.remote_ip).copied()?;
+        let local_mac = self.config.local_mac;
+        let packet = self.send_tcp_ipv4(key, payload, now)?;
+        Some(ethernet::serialize(
+            remote_mac,
+            local_mac,
+            ethernet::ETHERTYPE_IPV4,
+            &packet,
+        ))
     }
 
     /// Processes one Ethernet frame (TAP mode) and returns response frames.
