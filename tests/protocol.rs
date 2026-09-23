@@ -368,6 +368,61 @@ fn tcp_sink_acknowledges_without_echoing() {
 }
 
 #[test]
+fn tcp_sink_delays_ack_until_a_second_segment_or_timeout() {
+    let mut stack = Stack::new(Config {
+        tcp_sink_ports: vec![8080],
+        ..Config::default()
+    });
+    let now = Instant::now();
+    let (client_seq, server_seq) = connect(&mut stack, 30_010, now);
+
+    assert!(
+        tcp_send(
+            &mut stack,
+            30_010,
+            client_seq,
+            server_seq,
+            tcp::ACK,
+            b"first",
+            now,
+        )
+        .is_empty()
+    );
+    assert!(stack.tick_ipv4(now + Duration::from_millis(9)).is_empty());
+    let delayed = stack.tick_ipv4(now + Duration::from_millis(10));
+    assert_eq!(
+        parse_tcp_response(&delayed[0]).acknowledgment,
+        client_seq + 5
+    );
+
+    assert!(
+        tcp_send(
+            &mut stack,
+            30_010,
+            client_seq + 5,
+            server_seq,
+            tcp::ACK,
+            b"second",
+            now,
+        )
+        .is_empty()
+    );
+    let cumulative = tcp_send(
+        &mut stack,
+        30_010,
+        client_seq + 11,
+        server_seq,
+        tcp::ACK,
+        b"third",
+        now,
+    );
+    assert_eq!(
+        parse_tcp_response(&cumulative[0]).acknowledgment,
+        client_seq + 16
+    );
+}
+
+#[test]
 fn stack_can_send_tcp_data_to_an_established_peer() {
     let mut stack = stack();
     let now = Instant::now();

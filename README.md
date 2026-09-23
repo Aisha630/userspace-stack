@@ -54,13 +54,13 @@ end-to-end number through the Linux networking stack and TAP device.
 from the Linux socket into this stack's sink. Both paths include Ethernet and
 IPv4 framing, TCP checksums, the TAP device, and the Linux TCP stack.
 
-In a matched five-run benchmark, this stack delivered 5.5% higher outbound
+In a matched five-run benchmark, this stack delivered 28.5% higher outbound
 TCP throughput than smoltcp v0.14.0:
 
 | Stack | Stack → Linux | Linux → stack |
 | --- | ---: | ---: |
-| userspace-stack | 7.802 Gbps | 4.524 Gbps |
-| smoltcp v0.14.0 | 7.394 Gbps | 17.167 Gbps |
+| userspace-stack | 9.136 Gbps | 7.157 Gbps |
+| smoltcp v0.14.0 | 7.111 Gbps | 17.131 Gbps |
 
 Results are medians from ~1 GB single-connection transfers on the same Apple
 M4 Pro Docker Desktop Linux/arm64 VM with Rust 1.91 and each project's release

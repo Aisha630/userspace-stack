@@ -74,7 +74,8 @@ pub fn serialize(
     payload: &[u8],
 ) -> Vec<u8> {
     assert!(payload.len() <= u16::MAX as usize - 20);
-    let mut bytes = vec![0u8; 20];
+    let mut bytes = Vec::with_capacity(20 + payload.len());
+    bytes.resize(20, 0);
     bytes[0] = 0x45;
     bytes[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
     bytes[4..6].copy_from_slice(&identification.to_be_bytes());

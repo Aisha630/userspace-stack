@@ -1,5 +1,6 @@
 use crate::checksum;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 pub const FIN: u16 = 0x001;
@@ -7,6 +8,8 @@ pub const SYN: u16 = 0x002;
 pub const RST: u16 = 0x004;
 pub const PSH: u16 = 0x008;
 pub const ACK: u16 = 0x010;
+
+const DELAYED_ACK_TIMEOUT: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment<'a> {
@@ -52,7 +55,8 @@ pub fn serialize(
     window: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut bytes = vec![0u8; 20];
+    let mut bytes = Vec::with_capacity(20 + payload.len());
+    bytes.resize(20, 0);
     bytes[0..2].copy_from_slice(&src_port.to_be_bytes());
     bytes[2..4].copy_from_slice(&dst_port.to_be_bytes());
     bytes[4..8].copy_from_slice(&sequence.to_be_bytes());
@@ -66,12 +70,50 @@ pub fn serialize(
     bytes
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionKey {
     pub remote_ip: [u8; 4],
     pub remote_port: u16,
     pub local_port: u16,
 }
+
+impl Hash for ConnectionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let packed = (u64::from(u32::from_be_bytes(self.remote_ip)) << 32)
+            | (u64::from(self.remote_port) << 16)
+            | u64::from(self.local_port);
+        state.write_u64(packed);
+    }
+}
+
+#[derive(Default)]
+struct ConnectionHasher(u64);
+
+impl Hasher for ConnectionHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = mix64(hash);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = mix64(value);
+    }
+}
+
+fn mix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+type ConnectionMap = HashMap<ConnectionKey, Connection, BuildHasherDefault<ConnectionHasher>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -104,6 +146,9 @@ struct Connection {
     recv_next: u32,
     send_next: u32,
     peer_window: u16,
+    in_flight: usize,
+    pending_ack_since: Option<Instant>,
+    received_since_ack: u8,
     outstanding: Vec<Outstanding>,
 }
 
@@ -118,7 +163,7 @@ pub struct Engine {
     local_ip: [u8; 4],
     listeners: Vec<u16>,
     sink_ports: Vec<u16>,
-    connections: HashMap<ConnectionKey, Connection>,
+    connections: ConnectionMap,
     rto: Duration,
 }
 
@@ -133,7 +178,7 @@ impl Engine {
             local_ip,
             listeners,
             sink_ports,
-            connections: HashMap::new(),
+            connections: HashMap::with_hasher(BuildHasherDefault::default()),
             rto,
         }
     }
@@ -153,21 +198,21 @@ impl Engine {
         if connection.state != State::Established {
             return 0;
         }
-        let in_flight = connection
-            .outstanding
-            .iter()
-            .map(|sent| sent.end_sequence.wrapping_sub(sent.sequence) as usize)
-            .sum::<usize>();
-        usize::from(connection.peer_window).saturating_sub(in_flight)
+        usize::from(connection.peer_window).saturating_sub(connection.in_flight)
     }
 
     pub fn send(&mut self, key: ConnectionKey, payload: &[u8], now: Instant) -> Option<Outbound> {
-        if payload.is_empty() || payload.len() > self.send_capacity(key) {
+        let connection = self.connections.get_mut(&key)?;
+        let capacity = usize::from(connection.peer_window).saturating_sub(connection.in_flight);
+        if payload.is_empty() || connection.state != State::Established || payload.len() > capacity
+        {
             return None;
         }
-        let connection = self.connections.get_mut(&key)?;
         let sequence = connection.send_next;
         connection.send_next = connection.send_next.wrapping_add(payload.len() as u32);
+        connection.in_flight += payload.len();
+        connection.pending_ack_since = None;
+        connection.received_since_ack = 0;
         connection.outstanding.push(Outstanding {
             sequence,
             end_sequence: connection.send_next,
@@ -195,7 +240,7 @@ impl Engine {
         remote_ip: [u8; 4],
         segment: &Segment<'_>,
         now: Instant,
-    ) -> (Vec<Outbound>, Vec<Event>) {
+    ) -> (Option<Outbound>, Vec<Event>) {
         let key = ConnectionKey {
             remote_ip,
             remote_port: segment.src_port,
@@ -205,14 +250,14 @@ impl Engine {
         if segment.flags & RST != 0 {
             let existed = self.connections.remove(&key).is_some();
             return (
-                Vec::new(),
+                None,
                 existed.then_some(Event::Reset(key)).into_iter().collect(),
             );
         }
 
         if !self.connections.contains_key(&key) {
             if segment.flags & SYN == 0 || !self.listeners.contains(&segment.dst_port) {
-                return (Vec::new(), Vec::new());
+                return (None, Vec::new());
             }
             let iss = initial_sequence(key);
             let mut connection = Connection {
@@ -220,6 +265,9 @@ impl Engine {
                 recv_next: segment.sequence.wrapping_add(1),
                 send_next: iss.wrapping_add(1),
                 peer_window: segment.window,
+                in_flight: 1,
+                pending_ack_since: None,
+                received_since_ack: 0,
                 outstanding: Vec::new(),
             };
             let bytes = make_segment(
@@ -240,11 +288,11 @@ impl Engine {
             });
             self.connections.insert(key, connection);
             return (
-                vec![Outbound {
+                Some(Outbound {
                     key,
                     bytes,
                     retransmission: false,
-                }],
+                }),
                 Vec::new(),
             );
         }
@@ -252,9 +300,15 @@ impl Engine {
         let connection = self.connections.get_mut(&key).expect("connection exists");
         connection.peer_window = segment.window;
         if segment.flags & ACK != 0 {
-            connection
-                .outstanding
-                .retain(|sent| !seq_at_or_after(segment.acknowledgment, sent.end_sequence));
+            let mut acknowledged = 0;
+            connection.outstanding.retain(|sent| {
+                let is_acknowledged = seq_at_or_after(segment.acknowledgment, sent.end_sequence);
+                if is_acknowledged {
+                    acknowledged += sent.end_sequence.wrapping_sub(sent.sequence) as usize;
+                }
+                !is_acknowledged
+            });
+            connection.in_flight = connection.in_flight.saturating_sub(acknowledged);
         }
 
         let mut events = Vec::new();
@@ -275,7 +329,15 @@ impl Engine {
                         .recv_next
                         .wrapping_add(segment.payload.len() as u32);
                     if self.sink_ports.contains(&key.local_port) {
-                        response = Some((connection.send_next, ACK, Vec::new()));
+                        connection.received_since_ack =
+                            connection.received_since_ack.saturating_add(1);
+                        if connection.received_since_ack >= 2 || segment.flags & PSH != 0 {
+                            connection.pending_ack_since = None;
+                            connection.received_since_ack = 0;
+                            response = Some((connection.send_next, ACK, Vec::new()));
+                        } else {
+                            connection.pending_ack_since = Some(now);
+                        }
                     } else {
                         events.push(Event::Data(key, segment.payload.to_vec()));
                         let sequence = connection.send_next;
@@ -285,11 +347,15 @@ impl Engine {
                         response = Some((sequence, ACK | PSH, segment.payload.to_vec()));
                     }
                 } else if !segment.payload.is_empty() {
+                    connection.pending_ack_since = None;
+                    connection.received_since_ack = 0;
                     response = Some((connection.send_next, ACK, Vec::new()));
                 }
 
                 let fin_sequence = segment.sequence.wrapping_add(segment.payload.len() as u32);
                 if segment.flags & FIN != 0 && fin_sequence == connection.recv_next {
+                    connection.pending_ack_since = None;
+                    connection.received_since_ack = 0;
                     connection.recv_next = connection.recv_next.wrapping_add(1);
                     let sequence = connection.send_next;
                     connection.send_next = connection.send_next.wrapping_add(1);
@@ -320,6 +386,7 @@ impl Engine {
                 let sequence_space = payload.len() as u32
                     + u32::from(flags & SYN != 0)
                     + u32::from(flags & FIN != 0);
+                connection.in_flight += sequence_space as usize;
                 connection.outstanding.push(Outstanding {
                     sequence,
                     end_sequence: sequence.wrapping_add(sequence_space),
@@ -339,12 +406,31 @@ impl Engine {
         if remove {
             self.connections.remove(&key);
         }
-        (outbound.into_iter().collect(), events)
+        (outbound, events)
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Outbound> {
         let mut result = Vec::new();
         for (&key, connection) in &mut self.connections {
+            if connection
+                .pending_ack_since
+                .is_some_and(|started| now.duration_since(started) >= DELAYED_ACK_TIMEOUT)
+            {
+                result.push(Outbound {
+                    key,
+                    bytes: make_segment(
+                        self.local_ip,
+                        key,
+                        connection.send_next,
+                        connection.recv_next,
+                        ACK,
+                        &[],
+                    ),
+                    retransmission: false,
+                });
+                connection.pending_ack_since = None;
+                connection.received_since_ack = 0;
+            }
             for sent in &mut connection.outstanding {
                 let backoff = self.rto.saturating_mul(1u32 << sent.retries.min(5));
                 if now.duration_since(sent.last_sent) >= backoff {

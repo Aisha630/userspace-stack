@@ -1,4 +1,4 @@
-use crate::{MacAddr, arp, ethernet, icmp, ipv4, tcp, udp};
+use crate::{MacAddr, arp, checksum, ethernet, icmp, ipv4, tcp, udp};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,7 @@ pub struct Stack {
     config: Config,
     tcp: tcp::Engine,
     arp_cache: HashMap<[u8; 4], MacAddr>,
+    last_peer: Option<([u8; 4], MacAddr)>,
     events: Vec<StackEvent>,
     next_ip_id: u16,
 }
@@ -65,6 +66,7 @@ impl Stack {
             config,
             tcp,
             arp_cache: HashMap::new(),
+            last_peer: None,
             events: Vec::new(),
             next_ip_id: 1,
         }
@@ -101,15 +103,9 @@ impl Stack {
         payload: &[u8],
         now: Instant,
     ) -> Option<Vec<u8>> {
-        let remote_mac = self.arp_cache.get(&key.remote_ip).copied()?;
-        let local_mac = self.config.local_mac;
-        let packet = self.send_tcp_ipv4(key, payload, now)?;
-        Some(ethernet::serialize(
-            remote_mac,
-            local_mac,
-            ethernet::ETHERTYPE_IPV4,
-            &packet,
-        ))
+        let remote_mac = self.peer_mac(key.remote_ip)?;
+        let output = self.tcp.send(key, payload, now)?;
+        Some(self.wrap_ethernet_ipv4(remote_mac, key.remote_ip, ipv4::PROTOCOL_TCP, &output.bytes))
     }
 
     /// Processes one Ethernet frame (TAP mode) and returns response frames.
@@ -123,18 +119,15 @@ impl Stack {
         match frame.ethertype {
             ethernet::ETHERTYPE_ARP => self.handle_arp(frame.payload),
             ethernet::ETHERTYPE_IPV4 => {
-                if let Ok(packet) = ipv4::Packet::parse(frame.payload) {
-                    self.remember_peer(packet.src, frame.src);
-                }
-                self.process_ipv4_packet(frame.payload, now)
+                let Ok(packet) = ipv4::Packet::parse(frame.payload) else {
+                    return Vec::new();
+                };
+                self.remember_peer(packet.src, frame.src);
+                let remote_ip = packet.src;
+                self.process_parsed_ipv4(packet, now)
                     .into_iter()
-                    .map(|packet| {
-                        ethernet::serialize(
-                            frame.src,
-                            self.config.local_mac,
-                            ethernet::ETHERTYPE_IPV4,
-                            &packet,
-                        )
+                    .map(|(protocol, payload)| {
+                        self.wrap_ethernet_ipv4(frame.src, remote_ip, protocol, &payload)
                     })
                     .collect()
             }
@@ -147,20 +140,28 @@ impl Stack {
         let Ok(packet) = ipv4::Packet::parse(bytes) else {
             return Vec::new();
         };
-        if packet.dst != self.config.local_ip {
-            return Vec::new();
-        }
         let remote_ip = packet.src;
-        let outputs: Vec<(u8, Vec<u8>)> = match packet.protocol {
-            ipv4::PROTOCOL_ICMP => self.handle_icmp(remote_ip, packet.payload),
-            ipv4::PROTOCOL_UDP => self.handle_udp(remote_ip, packet.payload),
-            ipv4::PROTOCOL_TCP => self.handle_tcp(remote_ip, packet.payload, now),
-            _ => Vec::new(),
-        };
-        outputs
+        self.process_parsed_ipv4(packet, now)
             .into_iter()
             .map(|(protocol, payload)| self.wrap_ipv4(remote_ip, protocol, &payload))
             .collect()
+    }
+
+    fn process_parsed_ipv4(
+        &mut self,
+        packet: ipv4::Packet<'_>,
+        now: Instant,
+    ) -> Option<(u8, Vec<u8>)> {
+        if packet.dst != self.config.local_ip {
+            return None;
+        }
+        let remote_ip = packet.src;
+        match packet.protocol {
+            ipv4::PROTOCOL_ICMP => self.handle_icmp(remote_ip, packet.payload),
+            ipv4::PROTOCOL_UDP => self.handle_udp(remote_ip, packet.payload),
+            ipv4::PROTOCOL_TCP => self.handle_tcp(remote_ip, packet.payload, now),
+            _ => None,
+        }
     }
 
     /// Runs retransmission timers and returns Ethernet frames for known peers.
@@ -169,19 +170,12 @@ impl Stack {
             .tick(now)
             .into_iter()
             .filter_map(|out| {
-                let mac = self.arp_cache.get(&out.key.remote_ip).copied()?;
-                let ip = ipv4::serialize(
-                    self.config.local_ip,
+                let mac = self.peer_mac(out.key.remote_ip)?;
+                Some(self.wrap_ethernet_ipv4(
+                    mac,
                     out.key.remote_ip,
                     ipv4::PROTOCOL_TCP,
-                    self.take_ip_id(),
                     &out.bytes,
-                );
-                Some(ethernet::serialize(
-                    mac,
-                    self.config.local_mac,
-                    ethernet::ETHERTYPE_IPV4,
-                    &ip,
                 ))
             })
             .collect()
@@ -219,24 +213,18 @@ impl Stack {
         )]
     }
 
-    fn handle_icmp(&mut self, remote_ip: [u8; 4], bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
-        let Some(request) = icmp::Packet::parse(bytes) else {
-            return Vec::new();
-        };
-        let Some(reply) = request.echo_reply() else {
-            return Vec::new();
-        };
+    fn handle_icmp(&mut self, remote_ip: [u8; 4], bytes: &[u8]) -> Option<(u8, Vec<u8>)> {
+        let request = icmp::Packet::parse(bytes)?;
+        let reply = request.echo_reply()?;
         self.events.push(StackEvent::IcmpEcho {
             remote_ip,
             bytes: request.payload.len(),
         });
-        vec![(ipv4::PROTOCOL_ICMP, reply)]
+        Some((ipv4::PROTOCOL_ICMP, reply))
     }
 
-    fn handle_udp(&mut self, remote_ip: [u8; 4], bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
-        let Some(datagram) = udp::Datagram::parse(remote_ip, self.config.local_ip, bytes) else {
-            return Vec::new();
-        };
+    fn handle_udp(&mut self, remote_ip: [u8; 4], bytes: &[u8]) -> Option<(u8, Vec<u8>)> {
+        let datagram = udp::Datagram::parse(remote_ip, self.config.local_ip, bytes)?;
         self.events.push(StackEvent::UdpDatagram {
             remote_ip,
             remote_port: datagram.src_port,
@@ -244,9 +232,9 @@ impl Stack {
             data: datagram.payload.to_vec(),
         });
         if !self.config.udp_echo_ports.contains(&datagram.dst_port) {
-            return Vec::new();
+            return None;
         }
-        vec![(
+        Some((
             ipv4::PROTOCOL_UDP,
             udp::serialize(
                 self.config.local_ip,
@@ -255,30 +243,72 @@ impl Stack {
                 datagram.src_port,
                 datagram.payload,
             ),
-        )]
+        ))
     }
 
-    fn handle_tcp(&mut self, remote_ip: [u8; 4], bytes: &[u8], now: Instant) -> Vec<(u8, Vec<u8>)> {
-        let Some(segment) = tcp::Segment::parse(remote_ip, self.config.local_ip, bytes) else {
-            return Vec::new();
-        };
+    fn handle_tcp(
+        &mut self,
+        remote_ip: [u8; 4],
+        bytes: &[u8],
+        now: Instant,
+    ) -> Option<(u8, Vec<u8>)> {
+        let segment = tcp::Segment::parse(remote_ip, self.config.local_ip, bytes)?;
         let (outbound, events) = self.tcp.handle(remote_ip, &segment, now);
         self.events.extend(events.into_iter().map(StackEvent::Tcp));
-        outbound
-            .into_iter()
-            .map(|out| (ipv4::PROTOCOL_TCP, out.bytes))
-            .collect()
+        outbound.map(|out| (ipv4::PROTOCOL_TCP, out.bytes))
     }
 
     fn remember_peer(&mut self, ip: [u8; 4], mac: MacAddr) {
+        if self.last_peer == Some((ip, mac)) {
+            return;
+        }
+        self.last_peer = Some((ip, mac));
         if self.arp_cache.insert(ip, mac) != Some(mac) {
             self.events.push(StackEvent::ArpLearned { ip, mac });
         }
     }
 
+    fn peer_mac(&self, ip: [u8; 4]) -> Option<MacAddr> {
+        self.last_peer
+            .filter(|(peer_ip, _)| *peer_ip == ip)
+            .map(|(_, mac)| mac)
+            .or_else(|| self.arp_cache.get(&ip).copied())
+    }
+
     fn wrap_ipv4(&mut self, remote_ip: [u8; 4], protocol: u8, payload: &[u8]) -> Vec<u8> {
         let id = self.take_ip_id();
         ipv4::serialize(self.config.local_ip, remote_ip, protocol, id, payload)
+    }
+
+    fn wrap_ethernet_ipv4(
+        &mut self,
+        remote_mac: MacAddr,
+        remote_ip: [u8; 4],
+        protocol: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        const IPV4_HEADER_LEN: usize = 20;
+        let ip_len = IPV4_HEADER_LEN + payload.len();
+        assert!(ip_len <= u16::MAX as usize);
+
+        let mut bytes = vec![0u8; ethernet::HEADER_LEN + ip_len];
+        bytes[0..6].copy_from_slice(&remote_mac);
+        bytes[6..12].copy_from_slice(&self.config.local_mac);
+        bytes[12..14].copy_from_slice(&ethernet::ETHERTYPE_IPV4.to_be_bytes());
+
+        let ip = &mut bytes[ethernet::HEADER_LEN..ethernet::HEADER_LEN + IPV4_HEADER_LEN];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        ip[4..6].copy_from_slice(&self.take_ip_id().to_be_bytes());
+        ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = protocol;
+        ip[12..16].copy_from_slice(&self.config.local_ip);
+        ip[16..20].copy_from_slice(&remote_ip);
+        let sum = checksum::internet(ip);
+        ip[10..12].copy_from_slice(&sum.to_be_bytes());
+        bytes[ethernet::HEADER_LEN + IPV4_HEADER_LEN..].copy_from_slice(payload);
+        bytes
     }
 
     fn take_ip_id(&mut self) -> u16 {
